@@ -26,7 +26,8 @@ What a stoppage looks like in tracking, and the signal used for each:
      ceasing to rest), that strike is the restart instant, and the ball is alive from there --
      even if the players are still slow, which they are for a couple of seconds after any
      restart. The stretch between the ball leaving rest and the strike (the taker's touch) is
-     dead too.
+     dead too. Where no kick is seen, the stoppage ends where the players speed up again, which
+     is RESTART_LAG after the real restart; that lag is taken off.
   5. Smart Tagging SET PIECES are a prior that a stoppage exists. The tagged window (~35 s, 5 s for
      kick-offs) surrounds the restart but does not mark it, so the instant is looked for in the
      tracking: a kicked still ball in the window, else the end of a detected stoppage in the
@@ -87,6 +88,11 @@ KICK_SPEED = 5.0
 # The taker usually touches or rolls the ball before striking it, so the kick comes up to ~2 s
 # after the ball stops being at rest; the restart instant is the kick itself, not the first touch.
 KICK_LAG = 2 * FPS
+# After a restart the players need a couple of seconds to accelerate back above walking pace, so
+# a stoppage found from their speed ends late. Measured on the Metrica sample data (the declared
+# training data, Sample_Game_3): the median detected end is 1.9 s after the event-log restart.
+# Rounded to 2 s and removed from every stoppage end that is not an observed kick.
+RESTART_LAG = 2 * FPS
 SET_PIECE_CODE = "set pieces"
 
 
@@ -234,6 +240,16 @@ def detect(data, tags, pitch=GAMES[GAME]["pitch"]):
 
     # 4. A kicked restart ends the stoppage there.
     _end_at_kicks(dead, restarts)
+
+    # 4b. Other stoppages end where the players' speed says, which is RESTART_LAG after the
+    # restart: move those ends back, never below MIN_DEAD.
+    kicks = set(restarts)
+    for start, stop in _runs(dead):
+        if stop in kicks or stop >= len(dead):
+            continue
+        new_stop = max(start + MIN_DEAD, stop - RESTART_LAG)
+        if new_stop < stop:
+            dead[new_stop:stop] = False
 
     # 6. Fill short live gaps inside a stoppage, then drop stoppages too short to be real.
     for start, stop in _runs(~dead):
