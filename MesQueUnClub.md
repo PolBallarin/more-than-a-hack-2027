@@ -1,134 +1,170 @@
-# MesQueUnClub — More than a Hack 2027, Phase 1
+# MesQueUnClub — how we tackled possession
 
-Team: MesQueUnClub (Pol Ballarin, Pau Canosa, Oriol Bracons, Robert Cuello). Repository: this fork of
-`metrica-sports/more-than-a-hack-2027`. Submission file: `MesQueUnClub.csv`.
+Team: MesQueUnClub (Pol Ballarin, Pau Canosa, Oriol Bracons, Robert Cuello)
+Repo: https://github.com/PolBallarin/more-than-a-hack-2027 · File: `MesQueUnClub.csv`
 
-## 1. Approach
+## TL;DR
 
-A rule-based pipeline on the tactical tracking, with no learned model. Every threshold is a
-physical quantity with its justification written next to it in the code; none was tuned on the
-public five minutes, and none refers to specific frames of the match.
+No neural nets, no training loop. We built a small rule-based pipeline on top of the tactical
+tracking, where every threshold is a number we can defend physically ("people walk at ~1.4 m/s"),
+not one we found by trying values until the score went up. It beats the baseline everywhere we can
+measure it, it regenerates the exact same CSV from a clean clone, and the whole thing runs in a
+couple of minutes on a laptop.
+
+## Why rules and not a model
+
+We had one long weekend and one match with no labels we were allowed to train on. The only
+labelled data we could legally use was a single public Metrica sample game, with cleaner tracking
+than ours. Training a model on one match and hoping it transfers to a noisier one felt like a good
+way to fool ourselves.
+
+So we went the other way: work out what a stoppage and a possession actually *look like* in
+tracking data, write that down as code, and keep it simple enough that we can tell why it got a
+frame wrong.
+
+The pipeline is four small modules plus one entry point:
 
 ```
-mqc/atd.py         tracking -> arrays indexed by video frame (frame_id - 1)
-mqc/tagging.py     Smart Tagging intervals in video frames
-mqc/dead_ball.py   bool per frame: is the ball out of play?
-mqc/possession.py  H / A per live frame; D exactly where dead_ball says
-make_submission.py chains them and writes the CSV
+mqc/atd.py          parse the tracking into arrays indexed by video frame
+mqc/tagging.py      Smart Tagging intervals in video frames
+mqc/dead_ball.py    is the ball dead on this frame? (bool)
+mqc/possession.py   H or A on live frames, D exactly where dead_ball says so
+make_submission.py  glue + write the CSV
 ```
 
-We split the problem in two because the metric does: a stray `D` or a flicker to the other team
-splits a possession, and spellF1 punishes that more than anything else. So both modules aim for
-few, well-placed transitions rather than per-frame accuracy.
+We split it in two on purpose, because the metric punishes two different mistakes. A stray `D` in
+the middle of a possession cuts it in half, and so does a one-frame flicker to the other team.
+spellF1 hates both, so both modules optimise for *few, well-placed transitions* rather than
+per-frame accuracy.
 
-**Why not "no ball = dead ball"** (what the baseline does): on this match the ball is missing on
-~41% of graded frames, in long blocks (median 10.7 s) during live play, and it is visible during
-many stoppages. Visibility is therefore not used as a dead-ball signal at all.
+## Dead ball: stop trusting the ball
 
-## 2. Dead ball (`mqc/dead_ball.py`)
+The baseline says "no ball, dead ball". On this match that's just wrong: the ball goes missing on
+about 41% of graded frames, in long blocks (median ~11 s) during live play, and it's often
+perfectly visible during stoppages. So we stopped using visibility as a signal at all and looked
+at what the players do instead.
 
-What a stoppage looks like in tracking, and the signal used for each:
+What we use, roughly in order of how much it matters:
 
-1. **Everybody walks, and at some point nearly stops.** Median speed of the tracked players,
-   averaged over ±1 s. A walking stretch (< 1.4 m/s, preferred human walking speed) is a stoppage
-   only if it dips below 1.0 m/s (slow-walk lower bound) somewhere; this hysteresis separates
-   stoppages from slow build-up. The median, not the mean, so one glitching tracklet cannot swing
-   it.
-2. **The ball is off the pitch** by more than 1 m (ball size plus position noise). The stoppage
-   extends over the 3 s the players need to decelerate after it.
-3. **The ball is placed**: visible, on the pitch, below 0.5 m/s for at least 1 s.
-4. **The restart is a kick**: the first frame above 5 m/s within 2 s after a placed ball. From
-   there the ball is alive whatever the players' speed. Where no kick is seen, the stoppage ends
-   where the players speed up again, which is ~2 s after the real restart (players accelerate);
-   that lag, measured on the training data (§4), is taken off.
-5. **Smart Tagging SET PIECES** as a prior: each tagged window (~35 s, 5 s for kick-offs) must
-   contain a stoppage ending at a restart found in the tracking (a kick, else the end of a detected
-   stoppage, else the moment players speed back up after their slowest point in the window). The
-   tag's own boundaries are not trusted.
-6. **Stoppages last**: dead runs under 2 s are dropped, live gaps under 1 s inside a stoppage are
-   filled.
+1. **Everyone slows down.** During a stoppage people walk around; during play the typical player
+   jogs. We take the *median* speed of the tracked players (median, so one glitchy tracklet doesn't
+   wreck it), smooth it over ±1 s, and call it walking below 1.4 m/s. That alone over-fires on
+   slow build-up play, so we added hysteresis: a walking stretch only counts as a stoppage if at
+   some point it drops below 1.0 m/s, i.e. people actually stop. That one change removed most of
+   our false stoppages.
+2. **The ball is off the pitch.** More than 1 m past a line is out, no discussion. We also extend
+   the stoppage over the ~3 s the players need to brake after that.
+3. **The ball is being placed.** A ball sitting still (< 0.5 m/s) on the pitch for a second or
+   more is almost always someone setting up a set piece.
+4. **The restart is a kick.** First frame above 5 m/s within 2 s after a placed ball. From there
+   the ball is alive, even if everyone is still strolling. Our first version waited for the kick
+   right at the end of the still stretch and caught 1 restart out of 47; the taker usually nudges
+   the ball first, so we gave it 2 s and got 23.
+5. **Smart Tagging set pieces as a hint, not as truth.** Every SET PIECES window (~35 s) must
+   contain a stoppage, but we look for the actual restart instant in the tracking. We never trust
+   the tag's start and end.
+6. **Stoppages take time.** Anything under 2 s gets dropped, and tiny live gaps (< 1 s) inside a
+   stoppage get filled.
 
-## 3. Possession (`mqc/possession.py`)
+One last fix: when there's no kick to anchor the restart, the "players speed up again" signal
+fires about 2 s late, because people need a moment to accelerate. We measured that lag on the
+sample game (median 1.9 s), rounded it to 2 s and subtracted it. That's the only number we took
+from data instead of from first principles, and we're upfront about it.
 
-- **Control**: a player within 1.5 m of the ball (reach plus tracking noise) with no opponent that
-  close. Players of both teams that close = contested ball.
-- **Change of possession** only when the rival holds control for ≥ 0.3 s (a reception, not a
-  deflection or a player running past the ball). The change is dated to the start of that control.
-- **Loose ball, pass in flight, contested ball, ball not tracked**: possession stays with the last
-  team that controlled it (CHALLENGE.md).
-- **Restarts**: each live stretch starts with the team of its first control, carried back to the
-  restart frame. This avoids an `X` right after a `D`, which the scorer would fill as `D`.
-- **No control in a whole live stretch**: the Smart Tagging possession phase covering most of it
-  (PROGRESSION, BUILD UP, CREATING CHANCES, ATTACKING TRANSITION, whose Team is the side with the
-  ball); else the team of the nearest player on most visible frames; else `X` (~1% of live frames).
-- `X` is not used inside possessions: it is free on spellF1 but a certain miss on macroF1.
+## Possession: who actually has it
 
-## 4. Assets and training data
+The rule we settled on is basically how you'd explain it to a coach:
 
-| asset | used? | how |
-|---|---|---|
-| tactical tracking (ATD) | yes | everything above |
-| tactical Smart Tagging | yes, as a fallback only | set-piece windows (dead ball), attacking phases (possession without control) |
-| tactical homography | no | the ATD is already in pitch coordinates |
-| broadcast tracking / homography | no | not synchronised to tactical, weak (DATA.md) |
-| videos | no | |
-| Smart Tagging DEFENDING mirrors, unmirrored codes (LONG BALL, BALL IN FINAL THIRD, ...) | dropped | mirrors add nothing; unmirrored codes do not say who has the ball (58–70% agreement) |
+- **Control** = a player within 1.5 m of the ball (a stride plus tracking noise) with no opponent
+  that close. If both teams are that close, it's a 50/50 and nothing changes.
+- **Possession only flips when the other team holds the ball for 0.3 s.** That's a real
+  reception, not a deflection or someone running past. When it flips, we date the change to the
+  *start* of that control, not to when we became sure about it.
+- **Loose ball, pass in the air, scramble, tracker lost the ball:** possession stays with whoever
+  had it last. That's what the challenge rules say, and it's also what keeps us from flickering.
+- **After every restart**, the stretch starts with the team of the first control, carried back to
+  the restart frame. This one matters more than it looks: the scorer fills an `X` with the
+  previous label, and right after a stoppage that previous label is `D`, so an early `X` quietly
+  deletes the start of a possession.
+- **No control anywhere in a live stretch** (rare, ~1% of live frames): we take the team of the
+  Smart Tagging attacking phase covering it if there is one, otherwise whoever is closest to the
+  ball most of the time, otherwise `X`.
 
-**Training / validation data**: only **Metrica Sports Sample_Game_3**
-(github.com/metrica-sports/sample-data, commit `e706dd5`, SHA-256 checked; one match, 143,761
-frames, 3,620 events labelled by Metrica Sports). Nothing comes from the provided game.
+We don't use `X` inside possessions. It's free on spellF1, but it's a guaranteed miss on macroF1
+(the tie-break), and holding the last team is right most of the time anyway.
 
-- Per-frame labels derived from its event log by rules in `mqc/validation/sample_game.py`: team of
-  the last control event (PASS, CARRY, RECOVERY, SET PIECE, SHOT, BALL LOST); `D` from BALL OUT
-  (end), FAULT RECEIVED, goal or shot out, offside or hand ball, until the next SET PIECE or goal
-  kick.
-- Its ball is degraded to look like ours: removed in blocks bootstrapped from the ball
-  present/missing run lengths of our tracking (40.7% missing, median gap 10.7 s), seed 2027,
-  blind to the labels.
-- **Go/no-go**: we only allowed ourselves to use it for choosing between versions if it ranked
-  the four published baselines like the official full-match table (50 > 125 > 25 > raw). It gave
-  50 > 25 > 125 > raw (25 and 125 within 0.007), so it was **not** used to choose between
-  variants. That official table comes from the private ground truth as published in
-  `starter/baseline.py`; it was used for this check only. The sample game was used to diagnose
-  failure modes and to measure one physical quantity: the 2 s restart lag of §2.4.
-- The public five minutes were used only as pass/fail checks of the pipeline.
+## What we used, what we threw away
 
-Indicative, on the degraded validation game (not used for selection): spellF1 0.2706 for the
-baseline pipeline, 0.3697 for ours.
+| asset | verdict |
+|---|---|
+| Tactical tracking | the backbone of everything |
+| Smart Tagging | kept, but only as a fallback: set-piece windows for dead ball, attacking phases when tracking has nothing |
+| Smart Tagging DEFENDING codes | dropped, they just mirror the attacking ones |
+| LONG BALL, BALL IN FINAL THIRD, PLAYERS IN THE BOX… | dropped, they don't say who has the ball (58–70% agreement with us) |
+| Homography | not needed, tracking is already in pitch coordinates |
+| Broadcast feed | dropped: not synced to tactical, and much weaker |
+| Video | not used |
 
-## 5. Limitations and what we would do next
+## Training and validation data
 
-- **Dead-ball boundaries are the main loss.** With perfect stoppages our possession module scores
-  ~0.51 spellF1 on validation instead of ~0.37. The stoppage start is the weak point: the
-  players' deceleration lags the whistle by a variable amount.
-- **Quick possession changes are missed.** On validation we predict ~245 possessions against 401
-  (~350 on our match): short possessions without a sustained control are merged into the previous
-  one.
-- **The validation game is easier than ours**: its players are clean tracks of real people, and
-  its ball is absent during almost every stoppage. Only the ball was degraded.
-- **The ball-based dead-ball signals (placed ball, kick restart) and the Smart Tagging fallback
-  cannot be measured** without the private ground truth; they are included on physical grounds and
-  change few frames.
-- With more time: learn the control and dead-ball rules from several event-labelled public
-  matches, use the homography/video to see the ball when the tracking loses it, and model the
-  referee's whistle from collective deceleration.
+Everything labelled that we touched comes from **one public game: Metrica Sports
+Sample_Game_3** (github.com/metrica-sports/sample-data, pinned to commit `e706dd5`, SHA-256
+checked). That's 143,761 frames and 3,620 events, labelled by Metrica Sports. Nothing comes from
+the competition match.
 
-## 6. Reproduction
+How we turned it into a validation set:
+
+- **Labels from the event log.** The team is the one of the last event with the ball (PASS, CARRY,
+  RECOVERY, SET PIECE, SHOT, BALL LOST). Dead ball runs from BALL OUT / FAULT RECEIVED / goal /
+  offside until the next SET PIECE or goal kick. All of it is written in
+  `mqc/validation/sample_game.py`.
+- **Made the ball as bad as ours.** The sample game's ball is way too good, so we removed it in
+  blocks whose lengths are bootstrapped from *our* tracking's ball gaps (40.7% missing, median gap
+  10.7 s). Fixed seed, and it never looks at the labels.
+- **A sanity check before trusting it.** We said up front we'd only use it to pick between versions
+  if it ranked the four published baselines in the same order as the official full-match table
+  (50 > 125 > 25 > raw). It didn't: it swapped 25 and 125, which were 0.007 apart. So we did
+  **not** use it to choose variants. We used it to understand failure modes, and to measure that
+  one 2 s lag. (That official table comes from the private ground truth as published in
+  `starter/baseline.py`; we only used it for this check.)
+- **The public five minutes** were only ever a "does the pipeline run and look sane" check.
+
+For reference only, on the degraded sample game: the baseline pipeline scores 0.27 spellF1, ours
+0.37.
+
+## Where it breaks (and what we'd do with another week)
+
+- **Stoppage boundaries are where most of the score goes.** If we hand our possession module the
+  *true* stoppages on the sample game, it jumps from ~0.37 to ~0.51. The start of a stoppage is
+  the weak spot, because players don't all brake at the same time after the whistle.
+- **We miss quick turnovers.** We predict ~245 possessions on the sample game against 401 real
+  ones. Short possessions without a clean 0.3 s control get merged into the previous one.
+- **Our validation set is easier than the real thing.** Its players are clean tracks of real
+  people and the ball vanishes during almost every stoppage. We only degraded the ball.
+- **Some signals we couldn't measure at all.** The placed-ball, kick-restart and Smart Tagging
+  pieces only show up on our match, and we don't have its ground truth. They're in because the
+  physics makes sense, and they touch relatively few frames.
+- **With more time:** label a few more public games and learn the control and stoppage rules
+  instead of hand-writing them, use the video or homography to recover the ball when the tracker
+  loses it, and model the whistle from how the whole team decelerates.
+
+## Reproducing it
 
 ```bash
 git clone https://github.com/PolBallarin/more-than-a-hack-2027.git
 cd more-than-a-hack-2027
-python -m venv .venv                               # tested with Python 3.12.10
-.venv/bin/python -m pip install -r requirements.txt   # pinned: numpy, pandas (+ deps)
-export MTAH_DATA_DIR=/path/to/unpacked/bundle      # holds tactical/ (see data/README.md)
-.venv/bin/python make_submission.py                # -> evaluation/results/MesQueUnClub.csv
+python -m venv .venv                                  # we used Python 3.12.10
+.venv/bin/python -m pip install -r requirements.txt   # pinned with ==
+export MTAH_DATA_DIR=/path/to/unpacked/bundle         # folder that contains tactical/
+.venv/bin/python make_submission.py                   # -> evaluation/results/MesQueUnClub.csv
 .venv/bin/python evaluation/validate_submission.py evaluation/results/MesQueUnClub.csv
 ```
 
-Deterministic: no randomness in the pipeline (the validation set uses a fixed seed). Verified by
-regenerating from a clean clone and comparing the file byte for byte.
+There's nothing random in the pipeline. We checked it the boring way: fresh clone, fresh venv,
+regenerate, compare hashes. Same file, byte for byte.
 
-Validation set (optional, downloads ~55 MB of public Metrica data into `$MTAH_DATA_DIR/cache/`):
+If you want to rerun our validation set (it downloads ~55 MB of public Metrica data into
+`$MTAH_DATA_DIR/cache/`):
 
 ```bash
 .venv/bin/python mqc/validation/run.py --seeds 10
