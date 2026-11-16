@@ -17,8 +17,18 @@ Version 1 -- possession is CONTROL, and it only changes hands when the rival con
     starts with the team of its first control, carried back to the restart frame. This matters
     for the score: an X right after a D would be forward-filled as D by spellF1 and erase the
     start of the possession.
-  * A live stretch with no control at all (ball never close to anyone) takes the team of the
-    player nearest the ball on most of its visible frames, and X if the ball is never seen.
+  * A live stretch with no control at all (ball never close to anyone) has no tracking evidence
+    of its own. It takes the team of the Smart Tagging possession phase covering most of it, if
+    any (T4); otherwise the team of the player nearest the ball on most of its visible frames;
+    otherwise X.
+
+Smart Tagging (T4) is only a fallback, never an override: its possession phases agree with the
+control-based team about as often as that team is right on validation (~85%), so it cannot
+correct the tracking where the tracking has evidence. Only the attacking phases are used --
+PROGRESSION, BUILD UP, CREATING CHANCES, ATTACKING TRANSITION -- whose Team is the side with the
+ball; their DEFENDING mirrors carry the same interval and add nothing, and the unmirrored codes
+(LONG BALL, BALL IN FINAL THIRD, ...) do not say who has the ball. Team names are matched to
+`data.team_names`, case-insensitively.
 
 X is otherwise not used: inside a possession it is free on spellF1 but a certain miss on macroF1,
 while holding the team is right most of the time. Every constant is a physical quantity, none is
@@ -42,6 +52,8 @@ SUSTAIN = int(round(0.3 * FPS))
 # Control runs of one team separated by up to this many frames of noise are one control.
 CONTROL_GAP = 2
 NOBODY = atd.NOBODY
+# Smart Tagging phases whose Team is the side in possession.
+POSSESSION_PHASES = ("progression", "build up", "creating chances", "attacking transition")
 
 
 def _runs(mask):
@@ -80,7 +92,38 @@ def _control_spells(ctrl):
     return [(int(frames[a]), int(frames[b - 1]) + 1, int(teams[a])) for a, b in zip(starts, stops)]
 
 
-def _live_stretch(ctrl, nearest, start, stop):
+def tag_team(tags, team_names, n_frames):
+    """Per frame: HOME/AWAY from a Smart Tagging possession phase, NOBODY if none or conflicting."""
+    out = np.full(n_frames, NOBODY, dtype=np.int8)
+    if not tags:
+        return out
+    names = [str(name).strip().lower() for name in team_names]
+    home = np.zeros(n_frames, dtype=bool)
+    away = np.zeros(n_frames, dtype=bool)
+    for tag in tags:
+        if (tag.get("code") or "").strip().lower() not in POSSESSION_PHASES:
+            continue
+        team = (tag["tags"].get("Team") or "").strip().lower()
+        start, stop = max(0, tag["start_frame"]), min(n_frames, tag["end_frame"])
+        if team == names[atd.HOME]:
+            home[start:stop] = True
+        elif team == names[atd.AWAY]:
+            away[start:stop] = True
+    out[home & ~away] = atd.HOME
+    out[away & ~home] = atd.AWAY
+    return out
+
+
+def _majority(codes):
+    """HOME/AWAY by majority of non-NOBODY codes (ties to home), NOBODY if there are none."""
+    codes = codes[codes != NOBODY]
+    if not len(codes):
+        return NOBODY
+    home = int(np.sum(codes == atd.HOME))
+    return atd.HOME if home >= len(codes) - home else atd.AWAY
+
+
+def _live_stretch(ctrl, nearest, tagged, start, stop):
     """Team code per frame of one live stretch [start, stop)."""
     spells = _control_spells(ctrl[start:stop])
     out = np.full(stop - start, NOBODY, dtype=np.int8)
@@ -96,11 +139,13 @@ def _live_stretch(ctrl, nearest, start, stop):
         out[since:] = current
         return out
 
-    seen = nearest[start:stop]
-    seen = seen[seen != NOBODY]
-    if len(seen):
-        home = int(np.sum(seen == atd.HOME))
-        out[:] = atd.HOME if home >= len(seen) - home else atd.AWAY
+    # No control anywhere in the stretch: a tagged possession phase covering most of it, else the
+    # nearest player's team, else nothing (X).
+    window = tagged[start:stop]
+    if np.sum(window != NOBODY) * 2 > len(window):
+        out[:] = _majority(window)
+    else:
+        out[:] = _majority(nearest[start:stop])
     return out
 
 
@@ -108,9 +153,10 @@ def assign(data, dead, tags):
     """np.ndarray of '<U1', one label per video frame."""
     ctrl = control(data)
     nearest = atd.nearest_team(data)
+    tagged = tag_team(tags, data.team_names, len(dead))
     codes = np.full(len(dead), NOBODY, dtype=np.int8)
     for start, stop in _runs(~dead):
-        codes[start:stop] = _live_stretch(ctrl, nearest, start, stop)
+        codes[start:stop] = _live_stretch(ctrl, nearest, tagged, start, stop)
 
     labels = np.full(len(dead), "X", dtype="<U1")
     labels[codes == atd.HOME] = "H"
