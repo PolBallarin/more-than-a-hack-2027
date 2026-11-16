@@ -1,6 +1,6 @@
 # MesQueUnClub — More than a Hack 2027, Phase 1
 
-Team: MesQueUnClub (Pol Ballarin, Pau Canosa). Repository: this fork of
+Team: MesQueUnClub (Pol Ballarin, Pau Canosa, Oriol Bracons, Robert Cuello). Repository: this fork of
 `metrica-sports/more-than-a-hack-2027`. Submission file: `MesQueUnClub.csv`.
 
 ## 1. Approach
